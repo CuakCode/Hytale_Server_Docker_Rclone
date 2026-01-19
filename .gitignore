@@ -1,0 +1,15 @@
+Assets.zip
+Server/
+universe/
+logs/
+.cache/
+temp/
+*.auth
+credentials.json
+.hytale-auth/
+rclone.conf
+*.gz
+*.cp
+hytale-downloader-linux-amd64
+.hytale-downloader-credentials.json
+auth*

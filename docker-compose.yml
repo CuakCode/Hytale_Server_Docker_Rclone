@@ -1,0 +1,21 @@
+services:
+  hytale:
+    build: .
+    container_name: hytale_server
+    ports:
+      - "5520:5520/udp"
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ./:/data
+      - ./rclone.conf:/config/rclone.conf:ro
+      - ./Server/:/app/
+      - ./Assets.zip:/app/Assets.zip
+    environment:
+      - RAM_MAX=4G
+      - RCLONE_REMOTE=pcloud
+      - RCLONE_PATH=backup_hytale/universe
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    stop_grace_period: 2m
