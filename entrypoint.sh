@@ -5,12 +5,58 @@ RCLONE_REMOTE="${RCLONE_REMOTE:-myremote}"
 RCLONE_BUCKET="${RCLONE_PATH:-hytale/universe}"
 PIPE_INPUT="/tmp/hytale_input"
 
-echo "--- 🚀 Iniciando Wrapper de Hytale (Modo: Spy & Secure Backup) ---"
+# Configuración de Backups Locales Incrementales
+BACKUP_ROOT="/data/backups"
+TIMESTAMP=$(date +"%Y-%m-%d_%H%M%S")
+CURRENT_STATE="$BACKUP_ROOT/current"
+HISTORY_DIR="$BACKUP_ROOT/history/$TIMESTAMP"
 
-# 1. RESTAURAR BACKUP
+echo "--- 🚀 Iniciando Wrapper de Hytale (Modo: Incremental Versionado) ---"
+
+if [ -n "$HYTALE_SERVER_SESSION_TOKEN" ] && [ -n "$HYTALE_SERVER_IDENTITY_TOKEN" ]; then
+    echo "🔑 [Auth] Tokens detectados en variables de entorno."
+    echo "🔑 [Auth] El servidor intentará iniciar sesión automáticamente."
+else
+    echo "⚠️ [Auth] No se detectaron tokens en el .env."
+    echo "⚠️ [Auth] El servidor iniciará en modo NO AUTENTICADO (o pedirá /auth login)."
+fi
+
+# 1. BACKUP DE SEGURIDAD INCREMENTAL (Antes de sincronizar la nube)
+if [ -d "/data/universe" ]; then
+    echo "📦 [Backup] Verificando cambios para backup incremental..."
+    
+    # Creamos estructura de carpetas
+    mkdir -p "$CURRENT_STATE"
+    
+    # EXPLICACIÓN DEL COMANDO MÁGICO:
+    # sync: Hace que 'current' sea idéntico a 'universe'.
+    # --backup-dir: Antes de sobrescribir o borrar algo en 'current', mueve la versión vieja a 'history/...'.
+    # Resultado: 'current' siempre tiene la última versión, 'history' tiene lo antiguo.
+    rclone sync /data/universe "$CURRENT_STATE" \
+        --backup-dir "$HISTORY_DIR" \
+        --transfers=4 \
+        --checkers=8 \
+        -v \
+        --stats 5s
+        
+    # Si se creó una carpeta de historial (hubo cambios), avisamos
+    if [ -d "$HISTORY_DIR" ]; then
+        echo "✅ [Backup] Cambios detectados. Versión anterior guardada en: $HISTORY_DIR"
+    else
+        echo "✅ [Backup] No hubo cambios locales respecto al último backup."
+    fi
+
+    # LIMPIEZA AUTOMÁTICA (Opcional)
+    # Borra carpetas de historial de más de 14 días para no llenar el disco infinitamente
+    echo "🧹 [Limpieza] Buscando backups antiguos (+14 días)..."
+    rclone delete "$BACKUP_ROOT/history" --min-age 14d --rmdirs 2>/dev/null
+fi
+
+# 2. SINCRONIZAR DESDE LA NUBE (RESTAURAR)
 if [ -f "/config/rclone.conf" ]; then
-    echo "📥 [Rclone] Restaurando..."
-    # Usamos --update para no sobreescribir archivos locales si son más nuevos
+    echo "📥 [Rclone] Sincronizando cambios de la nube (Multi-PC)..."
+    
+    # Usamos --update para respetar archivos locales más nuevos
     rclone copy "$RCLONE_REMOTE:$RCLONE_BUCKET" /data/universe \
         --config /config/rclone.conf \
         --transfers=4 \
@@ -25,49 +71,43 @@ child=""
 monitor_pid=""
 spy_pid=""
 
-# Función de apagado (CORREGIDA PARA EVITAR BLOQUEOS)
+# Función de apagado
 shutdown_handler() {
     echo "🛑 [System] Señal de parada recibida."
     
-    # 1. Matar monitores primero
     if [ -n "$monitor_pid" ]; then kill "$monitor_pid" 2>/dev/null; fi
     if [ -n "$spy_pid" ]; then kill "$spy_pid" 2>/dev/null; fi
 
-    # 2. Cerrar Java y ESPERAR a que muera
     if [ -n "$child" ]; then
         echo "stop" > "$PIPE_INPUT" 2>/dev/null
         kill -TERM "$child" 2>/dev/null
         
         echo "⏳ Esperando cierre total de Java..."
         i=0
-        # Esperamos hasta 30 segundos
         while kill -0 "$child" 2>/dev/null && [ $i -lt 30 ]; do
             sleep 1
             i=$((i + 1))
         done
 
-        # Si sigue vivo, forzamos cierre
         if kill -0 "$child" 2>/dev/null; then
             echo "💀 Forzando cierre (kill -9)..."
             kill -9 "$child" 2>/dev/null
         else
             echo "✅ Servidor cerrado correctamente."
         fi
-        
-        # PAUSA DE SEGURIDAD: Vital para que el disco libere el 'lock' de los archivos
         sleep 2
     fi
     
-    # 3. SUBIR BACKUP (Ahora es seguro porque Java ya no existe)
+    # 3. SUBIR CAMBIOS A LA NUBE
     if [ -f "/config/rclone.conf" ]; then
-        echo "📤 [Rclone] Guardando backup..."
-        # --ignore-errors evita que se trabe si falla un archivo temporal
+        echo "📤 [Rclone] Subiendo cambios a la nube..."
         rclone copy /data/universe "$RCLONE_REMOTE:$RCLONE_BUCKET" \
             --config /config/rclone.conf \
             -v \
             --stats 5s \
+            --update \
             --ignore-errors
-        echo "✅ [Rclone] Backup finalizado."
+        echo "✅ [Rclone] Sincronización finalizada."
     fi
     exit 0
 }
@@ -81,49 +121,33 @@ sleep infinity > "$PIPE_INPUT" &
 
 echo "🎮 [Hytale] Iniciando servidor..."
 
-# --- EJECUCIÓN LIMPIA (SIN REDIRECCIONES) ---
-# Al no poner '>' ni '|', Java detecta una terminal real (TTY).
-# Esto soluciona el problema del "Modo Debug" y el chat roto.
+# Ejecución limpia (Sin redirecciones)
 java -Xmx${RAM_MAX} -XX:AOTCache=/app/HytaleServer.aot -jar /app/HytaleServer.jar --assets /app/Assets.zip --bind 0.0.0.0:5520 < "$PIPE_INPUT" &
 child=$!
 echo "✅ Java iniciado con PID: $child"
 
-# Esperamos un momento para que el sistema de archivos proc se inicie para este proceso
 sleep 2
 
-# --- MONITORIZACIÓN "ESPÍA" (/proc) + LOG DE JUEGO ---
-# 1. Buscamos el log normal para el chat y eventos del juego
+# Monitorización Espía
 logfile=$(find . -name "*.log" -type f -mmin -1 2>/dev/null | head -n 1)
-
-# 2. Definimos qué vigilar.
-# Vigilar el log del juego (si existe) Y ADEMÁS espiar el canal de error (fd/2) del proceso.
-# Esto captura los crashes de Java sin necesidad de redirigir la salida.
 FILES_TO_WATCH="/proc/$child/fd/2"
+
 if [ -n "$logfile" ]; then
-    echo "✅ Monitorizando Log de juego: $logfile y STDERR directo."
+    echo "✅ Monitorizando Log: $logfile + STDERR"
     FILES_TO_WATCH="$logfile /proc/$child/fd/2"
-else
-    echo "⚠️ Log de juego no encontrado aún, monitorizando solo STDERR (/proc)."
 fi
 
-# Usamos tail -F para seguir ambos flujos
 (tail -F -q $FILES_TO_WATCH 2>/dev/null | while read -r line; do
-    
-    # Ignorar comandos propios
     if echo "$line" | grep -q "Console executed command"; then continue; fi
 
-    # Si detectamos un crash de Java (que sale por /proc/.../fd/2), lo mostramos en docker logs
     if echo "$line" | grep -iqE "Exception|at |Caused by|STDERR"; then
         echo "🔥 [CRASH TRACE] $line"
     fi
     
-    # Lógica de Errores (Conteo y Reinicio)
     if echo "$line" | grep -iqE "java.lang|exception|throwable"; then
         count=$(cat /tmp/error_count 2>/dev/null || echo 0)
         count=$((count + 1))
         echo "$count" > /tmp/error_count
-        
-        # Avisar al juego
         echo "say ⚠️ Error detectado ($count)" > "$PIPE_INPUT"
         
         if [ "$count" -ge 10 ] && [ ! -f "/tmp/reboot_pending" ]; then
@@ -140,7 +164,6 @@ fi
         fi
     fi
     
-    # Lógica Aborto
     if echo "$line" | grep -iq "aborto"; then
         if [ -f "/tmp/reboot_pending" ]; then
             echo "say 🛑 REINICIO CANCELADO." > "$PIPE_INPUT"
@@ -151,7 +174,6 @@ fi
 done) &
 monitor_pid=$!
 
-# Bucle interactivo
 echo "✅ Consola lista."
 while kill -0 "$child" 2>/dev/null; do
     if read -r -t 0.5 cmd; then

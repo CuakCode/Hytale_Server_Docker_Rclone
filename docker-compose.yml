@@ -11,6 +11,8 @@ services:
       - ./rclone.conf:/config/rclone.conf:ro
       - ./Server/:/app/
       - ./Assets.zip:/app/Assets.zip
+    env_file:
+      - .env
     environment:
       - RAM_MAX=4G
       - RCLONE_REMOTE=pcloud
