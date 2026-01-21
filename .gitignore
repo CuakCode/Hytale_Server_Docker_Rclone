@@ -13,3 +13,4 @@ rclone.conf
 hytale-downloader-linux-amd64
 .hytale-downloader-credentials.json
 auth*
+.env
